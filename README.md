@@ -11,7 +11,7 @@
 
 First, install the dependencies
 ```sh
-pip install -U torch rotary_embedding_torch 'numpy<2'
+pip install -U torch rotary_embedding_torch numpy tensorboard
 ```
 
 To prepare the dataset, run

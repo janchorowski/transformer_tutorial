@@ -7,6 +7,7 @@ __pycache__/
 *.pkl
 *.pt
 *.pyc
-input.txt
+*.tmp
+*.tfevents*
 env/
 venv/
