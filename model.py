@@ -15,11 +15,12 @@ import torch
 import torch.nn as nn
 from rotary_embedding_torch import RotaryEmbedding
 from torch.nn import functional as F
-from torch.nn.attention.bias import causal_lower_right
+from torch.nn.attention.bias import CausalBias, causal_lower_right
 
 
 @dataclass
 class AttentionState:
+    # Shape for both is batch_size * num_heads * time * head_dimension
     k_cache: torch.Tensor | None = None
     v_cache: torch.Tensor | None = None
 
@@ -28,16 +29,26 @@ class AttentionState:
         return sum(t.numel() * t.element_size() for t in [self.k_cache, self.v_cache])
 
 
-class LayerNorm(nn.Module):
-    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
+def naive_attention(
+    query, key, value, attn_mask=None, dropout_p=0.0, scale=None
+) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
 
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+    if attn_mask is not None:
+        if isinstance(attn_mask, CausalBias):
+            attn_mask = attn_mask._materialize(device=query.device)
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
 
 
 class CausalSelfAttention(nn.Module):
@@ -91,15 +102,9 @@ class CausalSelfAttention(nn.Module):
         #  [1, 1, 1, 1]]
         attn_mask = causal_lower_right(q.size(2), k.size(2))
 
-        # manual multi-head attention, useful for extracting attention scores
-        #
-        # attn_scores = torch.einsum("nhqd,nhkd->nqkh", [q, k])
-        # attn_scores /= (q.size(-1) ** 0.5)
-        # mask = attn_mask._materialize(torch.cuda.current_device())[None, :, :, None]
-        # attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
-        # attn_scores = torch.softmax(attn_scores, dim=2)
-        # y = torch.einsum("nqkh,nhkd->nqhd", [attn_scores, v]).reshape(B, T, C)
-
+        # manual multi-head attention, useful for extracting attention scores is implemented in
+        # naive_attention above. It is a drop-in rpelacement of the built-in attention
+        # y = naive_attention(
         y = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -137,9 +142,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x, state):
@@ -173,7 +178,7 @@ class GPT(nn.Module):
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+                ln_f=nn.LayerNorm(config.n_embd, bias=config.bias),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -215,7 +220,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, block_states=None):
+    def forward(self, idx, block_states=None):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         x = self.transformer.drop(tok_emb)
@@ -234,7 +239,7 @@ class GPT(nn.Module):
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
         )
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -257,7 +262,7 @@ class GPT(nn.Module):
         )
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == "cuda"
+        use_fused = fused_available and "cuda" in device
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=betas, **extra_args
@@ -291,38 +296,5 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idxs.append(idx_next)
             logits, block_states = self(idx_next, block_states=block_states)
-
-            # Assignment 1
-            # ============
-            # When the sequence length is longer than during training, the model produces
-            # garbled output. This could be fixed by extrapolation of positional embeddings.
-            # We'll take a different approach. Limit length of the entries in KV cache
-            # to allow the model generate sequences longer than the training block size.
-
-            # Assignment 2
-            # ============
-            # Implement as many tricks as you can think of to reduce the size of block_states.
-            # Do not try to optimize the latency at all cost. Tip: pay attention to the offset
-            # when applying rotary embeddings when the KV cache has been modified.
-            #
-            # Training-free ideas include:
-            # - Quantizing the KV cache tensors to 8 bits. Which 8-bit format would you use?
-            #   What it would take to go lower than 8 bits?
-            # - Evicting (removing) unused tokens based on their cumulative attention scores
-            #   (tech hint: the code for extracting attn scores is commented out)
-            #
-            # Retrain / do a few gradient steps from a saved checkpoint to change how
-            # the model accesses its context:
-            # - Do a few gradient steps with a much longer context. How many are needed to
-            #   make it work?
-            # - Use grouped query attention (have fewer KV heads that query heads)
-            #   as in https://arxiv.org/abs/1911.02150 (tech hint: use the `enable_gqa`
-            #   argument of scaled_dot_product_attention)
-            # - Use long attention only in a few layers, limit others to small windows
-            #   and share attention between neighboring layers
-            #   https://research.character.ai/optimizing-inference/
-
-            # How low, in terms of KV size in bits can you go (theoretically, you can
-            # use masking and aligned data structures to make implementation easier)
 
         return torch.cat(idxs, dim=1)

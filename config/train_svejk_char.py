@@ -10,7 +10,6 @@ log_interval = 10  # don't print too too often
 always_save_checkpoint = False
 
 dataset = "svejk_char"
-gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256  # context of up to 256 previous characters
 
@@ -30,4 +29,3 @@ warmup_iters = 100  # not super necessary potentially
 
 # on macbook also add
 # device = 'cpu'  # run on cpu only
-# compile = False # do not torch compile the model
