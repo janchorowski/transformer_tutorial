@@ -7,11 +7,15 @@
   <img src="https://pl-bolts-doc-images.s3.us-east-2.amazonaws.com/app-2/studio-badge.svg" alt="Open in Studio" />
 </a>
 
+<a href="https://colab.research.google.com/drive/1CYMPmhnoRTYTOqJFS8tnshX3XTFi24se">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab" />
+</a>
+
 ## Quick Start
 
 First, install the dependencies
 ```sh
-pip install -U torch rotary_embedding_torch numpy tensorboard gdown
+pip install -r requirements.txt
 ```
 
 ## Training a model
