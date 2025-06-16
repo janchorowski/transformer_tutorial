@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from rotary_embedding_torch import RotaryEmbedding
 from torch.nn import functional as F
 from torch.nn.attention.bias import CausalBias, causal_lower_right
 
@@ -61,13 +60,43 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # positional embeddings
-        self.rotary_emb = RotaryEmbedding(dim=config.n_embd // config.n_head)
+        head_dim = config.n_embd // config.n_head
+        rope_theta = 10000
+        assert head_dim % 2 == 0
+        self.rope_freqs = nn.Buffer(
+            1.0
+            / (
+                rope_theta
+                ** ((torch.arange(0, head_dim) // 2).float() / (head_dim//2))
+            )
+        )
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+
+    @staticmethod
+    def _rot_half(v):
+        return torch.stack((-v[..., 1::2], v[..., ::2]), dim=-1).view(*v.size())
+
+    def _rope(self, q, k):
+        Tq = q.size(2)
+        Tk = k.size(2)
+        # Note: Tk >= Tq
+        phases = (
+            torch.arange(
+                Tq-Tk, Tq, device=self.rope_freqs.device, dtype=self.rope_freqs.dtype
+            ).view(1, 1, Tk, 1)
+            * self.rope_freqs
+        )
+        sins = torch.sin(phases).to(q)
+        coss = torch.cos(phases).to(q)
+
+        q = q * coss[:,:,-Tq:,:] +self._rot_half(q) * sins[:,:,-Tq:,:]
+        k = k * coss +self._rot_half(k) * sins
+        return q, k
 
     def forward(self, x, state: AttentionState | None = None):
         B, T, C = (
@@ -91,7 +120,7 @@ class CausalSelfAttention(nn.Module):
             v = torch.concat((state.v_cache, v), dim=2)
         state = AttentionState(k_cache=k.detach(), v_cache=v.detach())
 
-        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        q, k = self._rope(q, k)
 
         # when a state is provided we have more k and v entries than q entries,
         # in other words k.size(2) > q.size(2)

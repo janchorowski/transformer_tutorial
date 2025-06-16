@@ -19,7 +19,6 @@ pip install -r requirements.txt
 ```
 
 
-
 ## Exercises
 
 ### Assignment 1: Warmup
